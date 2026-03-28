@@ -11,7 +11,7 @@ echo "$(date +'%H:%M:%S') - INFO: Log file located at: $logfile"
 ########################################################
 ## Search for required commands and exit if not found ##
 ########################################################
-commands=( sed grep column cat sort find rm wc iconv awk printf )
+commands=( sed grep column cat sort find rm wc iconv awk printf python3 )
 
 if [[ -f $location/build-input/tvheadend.serverconf ]]; then
     commands+=( jq curl )
@@ -35,15 +35,16 @@ if [[ $location == *" "* ]]; then
     exit 1
 fi
 
-##############################################
-## Ask the user whether to build SNP or SRP ##
-##############################################
+#######################################################
+## Ask the user whether to build UTF8SNP, SNP or SRP ##
+#######################################################
 if [[ -z $1 ]]; then
     echo "Which style are you going to build?"
-    select choice in "Service Reference" "Service Name"; do
+    select choice in "Service Reference" "UTF8 Service Name" "Service Name (Being made redundant, please move to UTF8 Service Name)"; do
         case $choice in
             "Service Reference" ) style="srp"; break;;
-            "Service Name" ) style="snp"; break;;
+            "UTF8 Service Name" ) style="utf8snp"; break;;
+            "Service Name (Being made redundant, please move to UTF8 Service Name)" ) style="snp"; break;;
         esac
     done
 else
@@ -53,7 +54,7 @@ fi
 #############################
 ## Check if style is valid ##
 #############################
-if [[ ! $style = "srp" ]] && [[ ! $style = "snp" ]]; then
+if [[ ! $style = "srp" ]] && [[ ! $style = "snp" ]] && [[ ! $style = "utf8snp" ]]; then
     echo "$(date +'%H:%M:%S') - ERROR: Unknown style!"
     exit 1
 fi
@@ -72,6 +73,20 @@ if [[ -d $location/build-input/enigma2 ]]; then
     lamedb=$(<"$location/build-input/enigma2/lamedb")
     channelcount=$(cat "$location/build-input/enigma2/"*bouquet.* | grep -o '#SERVICE .*:0:.*:.*:.*:.*:.*:0:0:0' | sort -u | wc -l)
 
+    ## Build a serviceref->name map from bouquet #DESCRIPTION lines
+    ## Includes standard services and IPTV entries (excludes folder type 64 and sub-bouquet type 320)
+    bouquetmap=$(mktemp --suffix=.bouquetmap)
+    awk '
+        /^#DESCRIPTION/ { desc = substr($0, 14); sub(/\r/, "", desc); next }
+        /^#SERVICE/ {
+            if ($0 ~ /^#SERVICE 1:64:/ || $0 ~ /^#SERVICE 1:320:/) { desc = ""; next }
+            if (desc != "") {
+                ref = $0; sub(/^#SERVICE /, "", ref); sub(/:[\r]?$/, "", ref)
+                gsub(/:/, "_", ref); print toupper(ref) "\t" desc; desc = ""
+            }
+        }
+    ' $location/build-input/enigma2/*bouquet.* | sort -u > "$bouquetmap"
+
     cat $location/build-input/enigma2/*bouquet.* | grep -o '#SERVICE .*:0:.*:.*:.*:.*:.*:0:0:0' | sed -e 's/#SERVICE //g' -e 's/.*/\U&\E/' -e 's/:/_/g' | sort -u | while read serviceref ; do
         ((currentline++))
         if [[ $- == *i* ]]; then
@@ -79,26 +94,55 @@ if [[ -d $location/build-input/enigma2 ]]; then
         fi
 
         serviceref_id=$(sed -e 's/^[^_]*_0_[^_]*_//g' -e 's/_0_0_0$//g' <<< "$serviceref")
-        unique_id=${serviceref_id%????}
+        unique_id=$serviceref_id
         channelref=(${serviceref//_/ })
-        channelname=$(grep -i -A1 "${channelref[3]}:.*${channelref[6]}:.*${channelref[4]}:.*${channelref[5]}:.*:.*" <<< "$lamedb" | sed -n "2p" | iconv -f utf-8 -t ascii//translit 2>> $logfile | sed -e 's/^[ \t]*//' -e 's/|//g' -e 's/^//g')
 
         logo_srp=$(grep -i -m 1 "^$unique_id" <<< "$index" | sed -n -e 's/.*=//p')
         if [[ -z $logo_srp ]]; then logo_srp="--------"; fi
 
-        if [[ $style = "snp" ]]; then
+        if [[ $style = "utf8snp" ]]; then
+            channelname_lamedb=$(grep -i -A1 "0*${channelref[3]}:.*${channelref[6]}:.*${channelref[4]}:.*${channelref[5]}:.*:.*" <<< "$lamedb" | sed -n "2p" 2>> $logfile | sed -e 's/^[ \t]*//' -e 's/|//g' -e 's/\xef\xbb\xbf//g')
+            channelname_bouquet=$(grep -m 1 "^${serviceref}	" "$bouquetmap" | cut -f2)
+            channelname=${channelname_lamedb:-$channelname_bouquet}
+            utf8snpname=$(python3 -c "import unicodedata,sys; print(unicodedata.normalize('NFD', sys.argv[1]))" "$channelname" | sed -e 's/\(.*\)/\L\1/g' -e 's/[<>:"\/\\|?*]//g' -e 's/\.\+$//')
+            if [[ -z $utf8snpname ]]; then utf8snpname="--------"; fi
+            logo_utf8snp=$(grep -i -m 1 "^$utf8snpname=" <<< "$index" | sed -n -e 's/.*=//p')
+            if [[ -z $logo_utf8snp ]]; then logo_utf8snp="--------"; fi
+            echo -e "$serviceref\t$channelname\t$serviceref_id=$logo_srp\t$utf8snpname=$logo_utf8snp" >> $tempfile
+            ## If bouquet name differs from lamedb name (case-insensitive), output a second row
+            if [[ -n $channelname_lamedb ]] && [[ -n $channelname_bouquet ]] && [[ "${channelname_lamedb,,}" != "${channelname_bouquet,,}" ]]; then
+                utf8snpname2=$(python3 -c "import unicodedata,sys; print(unicodedata.normalize('NFD', sys.argv[1]))" "$channelname_bouquet" | sed -e 's/\(.*\)/\L\1/g' -e 's/[<>:"\/\\|?*]//g' -e 's/\.\+$//')
+                if [[ -z $utf8snpname2 ]]; then utf8snpname2="--------"; fi
+                logo_utf8snp2=$(grep -i -m 1 "^$utf8snpname2=" <<< "$index" | sed -n -e 's/.*=//p')
+                if [[ -z $logo_utf8snp2 ]]; then logo_utf8snp2="--------"; fi
+                echo -e "$serviceref\t$channelname_bouquet\t$serviceref_id=$logo_srp\t$utf8snpname2=$logo_utf8snp2" >> $tempfile
+            fi
+        elif [[ $style = "snp" ]]; then
+            channelname_lamedb=$(grep -i -A1 "0*${channelref[3]}:.*${channelref[6]}:.*${channelref[4]}:.*${channelref[5]}:.*:.*" <<< "$lamedb" | sed -n "2p" | iconv -f utf-8 -t ascii//translit 2>> $logfile | sed -e 's/^[ \t]*//' -e 's/|//g' -e 's/\xef\xbb\xbf//g')
+            channelname_bouquet=$(grep -m 1 "^${serviceref}	" "$bouquetmap" | cut -f2 | iconv -f utf-8 -t ascii//translit 2>> $logfile | sed -e 's/\xef\xbb\xbf//g')
+            channelname=${channelname_lamedb:-$channelname_bouquet}
             snpname=$(sed -e 's/&/and/g' -e 's/*/star/g' -e 's/+/plus/g' -e 's/\(.*\)/\L\1/g' -e 's/[^a-z0-9]//g' <<< "$channelname")
             if [[ -z $snpname ]]; then snpname="--------"; fi
             logo_snp=$(grep -i -m 1 "^$snpname=" <<< "$index" | sed -n -e 's/.*=//p')
             if [[ -z $logo_snp ]]; then logo_snp="--------"; fi
             echo -e "$serviceref\t$channelname\t$serviceref_id=$logo_srp\t$snpname=$logo_snp" >> $tempfile
+            ## If bouquet name differs from lamedb name (case-insensitive), output a second row
+            if [[ -n $channelname_lamedb ]] && [[ -n $channelname_bouquet ]] && [[ "${channelname_lamedb,,}" != "${channelname_bouquet,,}" ]]; then
+                snpname2=$(sed -e 's/&/and/g' -e 's/*/star/g' -e 's/+/plus/g' -e 's/\(.*\)/\L\1/g' -e 's/[^a-z0-9]//g' <<< "$channelname_bouquet")
+                if [[ -z $snpname2 ]]; then snpname2="--------"; fi
+                logo_snp2=$(grep -i -m 1 "^$snpname2=" <<< "$index" | sed -n -e 's/.*=//p')
+                if [[ -z $logo_snp2 ]]; then logo_snp2="--------"; fi
+                echo -e "$serviceref\t$channelname_bouquet\t$serviceref_id=$logo_srp\t$snpname2=$logo_snp2" >> $tempfile
+            fi
         else
+            channelname=$(grep -i -A1 "0*${channelref[3]}:.*${channelref[6]}:.*${channelref[4]}:.*${channelref[5]}:.*:.*" <<< "$lamedb" | sed -n "2p" | iconv -f utf-8 -t ascii//translit 2>> $logfile | sed -e 's/^[ \t]*//' -e 's/|//g' -e 's/\xef\xbb\xbf//g')
+            if [[ -z $channelname ]]; then channelname=$(grep -m 1 "^${serviceref}\t" "$bouquetmap" | cut -f2 | iconv -f utf-8 -t ascii//translit 2>> $logfile | sed -e 's/\xef\xbb\xbf//g'); fi
             echo -e "$serviceref\t$channelname\t$serviceref_id=$logo_srp" >> $tempfile
         fi
     done
 
     sort -t $'\t' -k 2,2 "$tempfile" | sed -e 's/\t/^|/g' | column -t -s $'^' | sed -e 's/|/  |  /g' > $file
-    rm $tempfile
+    rm $tempfile "$bouquetmap"
     echo "$(date +'%H:%M:%S') - INFO: Enigma2: Exported to $file"
 else
     echo "$(date +'%H:%M:%S') - ERROR: Enigma2: $location/build-input/enigma2 not found"
@@ -141,27 +185,41 @@ if [[ -f $location/build-input/tvheadend.serverconf ]]; then
             # fetching next channel
             rx_buf=$(curl -s --anyauth $url'/api/channel/grid?start='$channel'&limit=1' )
 
-            # extracting service reference and skip the rest if nothing usable found
+            # extracting service reference; IPTV channels won't have one in this form
             serviceref=$(echo $rx_buf |  jq -r '.entries[].icon'  | grep -o '1_0_.*_.*_.*_.*_.*_0_0_0')
 
-            if [[ ! -n $serviceref ]]; then
+            # skip if no service reference and style is srp (nothing useful to do without one)
+            if [[ ! -n $serviceref ]] && [[ $style = "srp" ]]; then
                 continue
             fi
 
-            serviceref_id=$(sed -e 's/^[^_]*_0_[^_]*_//g' -e 's/_0_0_0$//g' <<< "$serviceref")
-            unique_id=$(echo "$serviceref" | sed -n -e 's/^1_0_[^_]*_//p' | sed -n -e 's/_0_0_0$//p')
-            channelname=$(echo $rx_buf | jq -r '.entries | .[] | .name' | iconv -f utf-8 -t ascii//TRANSLIT)
+            channelname_raw=$(echo $rx_buf | jq -r '.entries | .[] | .name' | sed -e 's/\xef\xbb\xbf//g')
 
-            logo_srp=$(grep -i -m 1 "^$unique_id" <<< "$index" | sed -n -e 's/.*=//p')
+            if [[ -n $serviceref ]]; then
+                serviceref_id=$(sed -e 's/^[^_]*_0_[^_]*_//g' -e 's/_0_0_0$//g' <<< "$serviceref")
+                unique_id=$(echo "$serviceref" | sed -n -e 's/^1_0_[^_]*_//p' | sed -n -e 's/_0_0_0$//p')
+                logo_srp=$(grep -i -m 1 "^$unique_id" <<< "$index" | sed -n -e 's/.*=//p')
+            fi
             if [[ -z $logo_srp ]]; then logo_srp="--------"; fi
 
-            if [[ $style = "snp" ]]; then
+            if [[ $style = "utf8snp" ]]; then
+                channelname=$channelname_raw
+                # TVHeadend uses NFC for filenames; normalise to NFD only for index lookup, then convert back to NFC for output
+                utf8snpname_nfd=$(python3 -c "import unicodedata,sys; print(unicodedata.normalize('NFD', sys.argv[1]))" "$channelname" | sed -e 's/\(.*\)/\L\1/g' -e 's/[<>:"\/\\|?*]//g' -e 's/\.\+$//')
+                utf8snpname=$(python3 -c "import unicodedata,sys; print(unicodedata.normalize('NFC', sys.argv[1]))" "$channelname" | sed -e 's/\(.*\)/\L\1/g')
+                if [[ -z $utf8snpname ]]; then utf8snpname="--------"; fi
+                logo_utf8snp=$(grep -i -m 1 "^$utf8snpname_nfd=" <<< "$index" | sed -n -e 's/.*=//p')
+                if [[ -z $logo_utf8snp ]]; then logo_utf8snp="--------"; fi
+                echo -e "$serviceref\t$channelname\t$serviceref_id=$logo_srp\t$utf8snpname=$logo_utf8snp" >> $tempfile
+            elif [[ $style = "snp" ]]; then
+                channelname=$(iconv -f utf-8 -t ascii//TRANSLIT <<< "$channelname_raw" | sed -e 's/\xef\xbb\xbf//g')
                 snpname=$(sed -e 's/&/and/g' -e 's/*/star/g' -e 's/+/plus/g' -e 's/\(.*\)/\L\1/g' -e 's/[^a-z0-9]//g' <<< "$channelname")
                 if [[ -z $snpname ]]; then snpname="--------"; fi
                 logo_snp=$(grep -i -m 1 "^$snpname=" <<< "$index" | sed -n -e 's/.*=//p')
                 if [[ -z $logo_snp ]]; then logo_snp="--------"; fi
                 echo -e "$serviceref\t$channelname\t$serviceref_id=$logo_srp\t$snpname=$logo_snp" >> $tempfile
             else
+                channelname=$(iconv -f utf-8 -t ascii//TRANSLIT <<< "$channelname_raw" | sed -e 's/\xef\xbb\xbf//g')
                 echo -e "$serviceref\t$channelname\t$serviceref_id=$logo_srp" >> $tempfile
             fi
         done
@@ -213,19 +271,30 @@ if [[ -f $location/build-input/channels.conf ]]; then
         unique_id=$(sed -e 's/.*/\U&\E/' <<< "$sid"'_'"$tid"'_'"$nid"'_'"$namespace")
         serviceref='1_0_'"$channeltype"'_'"$unique_id"'0000_0_0_0'
         serviceref_id="$unique_id"'0000'
-        channelname=(${vdrchannel[0]})
-        channelname=$(iconv -f utf-8 -t ascii//translit <<< "${channelname[0]}" 2>> $logfile | sed -e 's/^[ \t]*//' -e 's/|//g' -e 's/^//g')
+        channelname_raw=(${vdrchannel[0]})
+        channelname_raw="${channelname_raw[0]}"
 
         logo_srp=$(grep -i -m 1 "^$unique_id" <<< "$index" | sed -n -e 's/.*=//p')
         if [[ -z $logo_srp ]]; then logo_srp="--------"; fi
 
-        if [[ $style = "snp" ]]; then
+        if [[ $style = "utf8snp" ]]; then
+            # VDR uses NFC for filenames; normalise to NFD only for index lookup, then convert back to NFC for output
+            channelname=$(sed -e 's/^[ \t]*//' -e 's/|//g' -e 's/\xef\xbb\xbf//g' <<< "$channelname_raw")
+            utf8snpname_nfd=$(python3 -c "import unicodedata,sys; print(unicodedata.normalize('NFD', sys.argv[1]))" "$channelname" | sed -e 's/\(.*\)/\L\1/g' -e 's/[<>:"\/\\|?*]//g' -e 's/\.\+$//')
+            utf8snpname=$(python3 -c "import unicodedata,sys; print(unicodedata.normalize('NFC', sys.argv[1]))" "$channelname" | sed -e 's/\(.*\)/\L\1/g')
+            if [[ -z $utf8snpname ]]; then utf8snpname="--------"; fi
+            logo_utf8snp=$(grep -i -m 1 "^$utf8snpname_nfd=" <<< "$index" | sed -n -e 's/.*=//p')
+            if [[ -z $logo_utf8snp ]]; then logo_utf8snp="--------"; fi
+            echo -e "$serviceref\t$channelname\t$serviceref_id=$logo_srp\t$utf8snpname=$logo_utf8snp" >> $tempfile
+        elif [[ $style = "snp" ]]; then
+            channelname=$(iconv -f utf-8 -t ascii//translit <<< "$channelname_raw" 2>> $logfile | sed -e 's/^[ \t]*//' -e 's/|//g' -e 's/\xef\xbb\xbf//g')
             snpname=$(sed -e 's/&/and/g' -e 's/*/star/g' -e 's/+/plus/g' -e 's/\(.*\)/\L\1/g' -e 's/[^a-z0-9]//g' <<< "$channelname")
             if [[ -z $snpname ]]; then snpname="--------"; fi
             logo_snp=$(grep -i -m 1 "^$snpname=" <<< "$index" | sed -n -e 's/.*=//p')
             if [[ -z $logo_snp ]]; then logo_snp="--------"; fi
             echo -e "$serviceref\t$channelname\t$serviceref_id=$logo_srp\t$snpname=$logo_snp" >> $tempfile
         else
+            channelname=$(iconv -f utf-8 -t ascii//translit <<< "$channelname_raw" 2>> $logfile | sed -e 's/^[ \t]*//' -e 's/|//g' -e 's/\xef\xbb\xbf//g')
             echo -e "$serviceref\t$channelname\t$serviceref_id=$logo_srp" >> $tempfile
         fi
     done
